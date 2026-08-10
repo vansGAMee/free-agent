@@ -6,6 +6,9 @@ import {appDir} from './config.js';
 
 export interface GeneratedFile{path:string;content:string}
 export interface GeneratedResponse{files:GeneratedFile[];commands:string[]}
+export interface CommandFailure extends Error{command:string;exitCode:number|string;output:string;repairAttempts?:number}
+export type RepairResponse=(failure:CommandFailure,attempt:number)=>Promise<GeneratedResponse>;
+export type CommandRunner=(projectRoot:string,command:string)=>Promise<void>;
 
 function promptFor(task:string){return `You are generating files for a local coding tool.
 
@@ -71,19 +74,8 @@ function validResponse(value:unknown):GeneratedResponse|null{
  return {files,commands:commands??[]};
 }
 
-function decodeLooseString(value:string){try{return JSON.parse(`"${value}"`) as string}catch{return JSON.parse(`"${value.replace(/(?<!\\)"/g,'\\"')}"`) as string}}
-
 export function generatedResponses(text:string){
- const responses=jsonObjects(text).map(validResponse).filter((x):x is GeneratedResponse=>x!==null);
- const loose:GeneratedFile[]=[];
- const blocks=/"path"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"([\s\S]*?)"\s*}\s*(?=,|\])/g;
- let lastFileEnd=0;
- for(const match of text.matchAll(blocks)){
-  const file={path:decodeLooseString(match[1]),content:decodeLooseString(match[2])};
-  if(file.path!=='relative/path'||file.content!=='<complete file content>'){loose.push(file);lastFileEnd=(match.index??0)+match[0].length}
- }
- if(loose.length){const commandMatch=text.slice(lastFileEnd).match(/"commands"\s*:\s*(\[(?:\s*"(?:\\.|[^"\\])*"\s*,?)*\s*\])/);let commands:string[]=[];if(commandMatch){try{commands=JSON.parse(commandMatch[1])}catch{}}responses.push({files:loose,commands})}
- return responses;
+ return jsonObjects(text).map(validResponse).filter((x):x is GeneratedResponse=>x!==null);
 }
 
 export function latestNewResponse(messageTexts:string[],baselineCount:number){if(messageTexts.length<=baselineCount)return null;return generatedResponses(messageTexts.at(-1)!).at(-1)??null}
@@ -111,9 +103,21 @@ export async function writeGeneratedFiles(projectRoot:string,files:GeneratedFile
 
 export function parseAllowedNpmCommand(command:string){const parts=command.trim().split(/\s+/);if(parts[0]!=='npm')throw new Error(`Unsafe command rejected: ${command}`);if(parts[1]==='install'&&parts.slice(2).every(part=>/^[A-Za-z0-9@][A-Za-z0-9@._/+~-]*$/.test(part)))return parts.slice(1);if(parts[1]==='run'&&parts.length===3&&/^[A-Za-z0-9_.:-]+$/.test(parts[2]))return parts.slice(1);throw new Error(`Unsafe command rejected: ${command}`)}
 
-async function runNpm(projectRoot:string,command:string,timeoutMs=120_000){let args=parseAllowedNpmCommand(command),executable='npm';if(process.platform==='win32'){executable=process.execPath;args=[path.join(path.dirname(process.execPath),'node_modules','npm','bin','npm-cli.js'),...args]}return new Promise<void>((resolve,reject)=>{const child=spawn(executable,args,{cwd:projectRoot,shell:false,windowsHide:true});let output='';const collect=(chunk:Buffer)=>{output=(output+chunk.toString()).slice(-4000)};child.stdout.on('data',collect);child.stderr.on('data',collect);const timer=setTimeout(()=>child.kill(),timeoutMs);child.on('error',error=>{clearTimeout(timer);reject(Object.assign(error,{command,exitCode:'spawn error'}))});child.on('close',code=>{clearTimeout(timer);if(output.trim())console.log(output.trim());if(code===0)resolve();else reject(Object.assign(new Error(`Command failed: ${command}`),{command,exitCode:code??'unknown'}))})})}
+async function runNpm(projectRoot:string,command:string,timeoutMs=120_000){const args=parseAllowedNpmCommand(command),executable=process.platform==='win32'?'npm.cmd':'npm';return new Promise<void>((resolve,reject)=>{const child=spawn(executable,args,{cwd:projectRoot,shell:false,windowsHide:true});let output='';const collect=(chunk:Buffer)=>{output=(output+chunk.toString()).slice(-12_000)};child.stdout.on('data',collect);child.stderr.on('data',collect);const timer=setTimeout(()=>child.kill(),timeoutMs);child.on('error',error=>{clearTimeout(timer);reject(Object.assign(error,{command,exitCode:'spawn error',output}))});child.on('close',code=>{clearTimeout(timer);if(output.trim())console.log(output.trim());if(code===0)resolve();else reject(Object.assign(new Error(`Command failed: ${command}`),{command,exitCode:code??'unknown',output}))})})}
 
-export async function applyGeneratedResponse(projectRoot:string,response:GeneratedResponse){response.commands.forEach(parseAllowedNpmCommand);await writeGeneratedFiles(projectRoot,response.files);for(const command of response.commands)await runNpm(projectRoot,command);return {filesCreated:response.files.length,commandsPassed:response.commands.length}}
+function commandFailure(error:unknown,command:string){const failure=(error instanceof Error?error:new Error(String(error))) as CommandFailure;failure.command||=command;failure.exitCode??='unknown';failure.output??='';return failure}
+
+export async function applyGeneratedResponse(projectRoot:string,response:GeneratedResponse,repair?:RepairResponse,runCommand:CommandRunner=runNpm){response.commands.forEach(parseAllowedNpmCommand);await writeGeneratedFiles(projectRoot,response.files);let repairAttempts=0;for(const command of response.commands){while(true){try{await runCommand(projectRoot,command);break}catch(error){const failure=commandFailure(error,command);if(!repair||repairAttempts>=2){failure.repairAttempts=repairAttempts;throw failure}const replacement=await repair(failure,++repairAttempts);await writeGeneratedFiles(projectRoot,replacement.files)}}}return {filesCreated:response.files.length,commandsPassed:response.commands.length,repairAttempts}}
+
+function repairPrompt(failure:CommandFailure,attempt:number){return `The generated project failed verification. Repair attempt ${attempt} of 2.
+Failed command: ${failure.command}
+Exit code: ${failure.exitCode}
+Output:
+${failure.output.slice(-12_000)}
+
+Return ONLY valid JSON with complete replacement file contents in this shape:
+{"files":[{"path":"relative/path","content":"<complete replacement file content>"}]}
+No markdown fences, explanation, or commands. Use only relative paths.`}
 
 export async function runSimpleDeepSeek(projectRoot:string,task:string){
  projectRoot=path.resolve(projectRoot);await fs.mkdir(projectRoot,{recursive:true});
@@ -128,6 +132,10 @@ export async function runSimpleDeepSeek(projectRoot:string,task:string){
   await input.click();await input.fill(promptFor(task));await input.press('Enter');
   console.log('Message sent. Waiting for DeepSeek JSON response...');
   const response=await waitForNewResponse(page,baseline);
-  return await applyGeneratedResponse(projectRoot,response);
+  return await applyGeneratedResponse(projectRoot,response,async(failure,attempt)=>{
+   const repairBaseline=await assistantMessages.count(),repairInput=await findChatInput(page);
+   await repairInput.click();await repairInput.fill(repairPrompt(failure,attempt));await repairInput.press('Enter');
+   return await waitForNewResponse(page,repairBaseline);
+  });
  }finally{await context.close()}
 }

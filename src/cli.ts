@@ -16,4 +16,4 @@ async function main(){
  const result=await runSimpleDeepSeek(path.resolve(project),task.trim());
  console.log(`SUCCESS\nFiles created: ${result.filesCreated}\nCommands passed: ${result.commandsPassed}`);
 }
-main().catch(error=>{if(error.command)console.error(`FAILED\nCommand: ${error.command}\nExit code: ${error.exitCode}`);else console.error(`FAILED: ${error.message}`);process.exitCode=1});
+main().catch(error=>{if(error.command)console.error(`FAILED\nCommand: ${error.command}\nExit code: ${error.exitCode}${error.repairAttempts!==undefined?`\nRepair attempts: ${error.repairAttempts}`:''}`);else console.error(`FAILED: ${error.message}`);process.exitCode=1});
