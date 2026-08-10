@@ -83,10 +83,9 @@ export function latestNewResponse(messageTexts:string[],baselineCount:number){if
 async function waitForNewResponse(page:Page,baselineCount:number,timeoutMs=300_000){
  const messages=page.locator('.ds-assistant-message-main-content');
  const end=Date.now()+timeoutMs;
- let previous='',stableChecks=0;
- while(Date.now()<end){
+  while(Date.now()<end){
   const count=await messages.count();
-  if(count>baselineCount){const text=await messages.last().innerText();const response=latestNewResponse([text],0);stableChecks=text===previous?stableChecks+1:0;previous=text;if(response&&stableChecks>=4)return response}
+  if(count>baselineCount){const text=await messages.last().innerText();const response=latestNewResponse([text],0);if(response)return response}
   await page.waitForTimeout(750);
  }
  throw new Error('DeepSeek did not finish a new valid files JSON response in time.')
