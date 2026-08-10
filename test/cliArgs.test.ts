@@ -1,0 +1,2 @@
+import {describe,it,expect} from 'vitest';import {positionalProject} from '../src/cliArgs.js';
+describe('CLI project argument',()=>{it('accepts the first positional project path',()=>expect(positionalProject(['C:\\Users\\me\\project'])).toBe('C:\\Users\\me\\project'));it('does not treat option values as the project',()=>expect(positionalProject(['--provider','deepseek','C:\\work'])).toBe('C:\\work'))});
