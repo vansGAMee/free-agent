@@ -13,7 +13,17 @@ export type CommandRunner=(projectRoot:string,command:string)=>Promise<void>;
 export type FileGenerator=(relativePath:string,repairAttempt:number)=>Promise<string>;
 export type RepairPlanner=(failure:CommandFailure,attempt:number)=>Promise<string[]>;
 export type AssistantRequester=(prompt:string)=>Promise<AssistantResponse>;
+export type WorkflowEvent=
+ |{type:'idle'}
+ |{type:'planning'}
+ |{type:'plan';files:number;commands:number}
+ |{type:'writing';path:string;index:number;total:number;repairAttempt?:number}
+ |{type:'command';command:string}
+ |{type:'repairing';attempt:number};
+export type ProgressReporter=(event:WorkflowEvent)=>void;
 type ResponseBaseline={count:number;lastText:string};
+
+const defaultProgressReporter:ProgressReporter=event=>{if(event.type==='idle')console.log('Waiting for DeepSeek chat input. Log in once in Chromium if needed...');else if(event.type==='plan')console.log(`Plan: ${event.files} files, ${event.commands} commands`);else if(event.type==='writing')console.log(`${event.repairAttempt?'Repairing':'Generating'} ${event.index}/${event.total}: ${event.path}`);else if(event.type==='command')console.log(`Running: ${event.command}`)};
 
 function manifestPrompt(task:string){return `Plan a complete local project for this user task:
 ${task}
@@ -266,41 +276,43 @@ async function runNpm(projectRoot:string,command:string,timeoutMs=600_000){
 
 function commandFailure(error:unknown,command:string){const failure=(error instanceof Error?error:new Error(String(error))) as CommandFailure;failure.command||=command;failure.exitCode??='unknown';failure.output??='';return failure}
 
-export async function executeProjectPlan(projectRoot:string,value:ProjectManifest,generateFile:FileGenerator,planRepair?:RepairPlanner,runCommand:CommandRunner=runNpm){
+export async function executeProjectPlan(projectRoot:string,value:ProjectManifest,generateFile:FileGenerator,planRepair?:RepairPlanner,runCommand:CommandRunner=runNpm,report:ProgressReporter=defaultProgressReporter){
  const manifest=validateProjectManifest(projectRoot,value);let repairAttempts=0;
- console.log(`Plan: ${manifest.files.length} files, ${manifest.commands.length} commands`);
- for(let i=0;i<manifest.files.length;i++){const file=manifest.files[i];console.log(`Generating ${i+1}/${manifest.files.length}: ${file}`);await writeGeneratedFiles(projectRoot,[{path:file,content:await generateFile(file,0)}]);console.log(`Wrote: ${file}`)}
+ report({type:'plan',files:manifest.files.length,commands:manifest.commands.length});
+ for(let i=0;i<manifest.files.length;i++){const file=manifest.files[i];report({type:'writing',path:file,index:i+1,total:manifest.files.length});await writeGeneratedFiles(projectRoot,[{path:file,content:await generateFile(file,0)}])}
  for(const command of manifest.commands){
   while(true){
-   try{await runCommand(projectRoot,command);break}catch(error){
+   try{report({type:'command',command});await runCommand(projectRoot,command);break}catch(error){
     const failure=commandFailure(error,command);
     if(!planRepair||repairAttempts>=2){failure.repairAttempts=repairAttempts;throw failure}
-    const repairFiles=validateFilePaths(projectRoot,await planRepair(failure,++repairAttempts),manifest.files);
-    for(let i=0;i<repairFiles.length;i++){const file=repairFiles[i];console.log(`Repairing ${i+1}/${repairFiles.length}: ${file}`);await writeGeneratedFiles(projectRoot,[{path:file,content:await generateFile(file,repairAttempts)}]);console.log(`Wrote: ${file}`)}
-    if(command!=='npm install'&&repairFiles.some(file=>file.toLowerCase()==='package.json')&&manifest.commands.includes('npm install'))await runCommand(projectRoot,'npm install');
+    report({type:'repairing',attempt:++repairAttempts});
+    const repairFiles=validateFilePaths(projectRoot,await planRepair(failure,repairAttempts),manifest.files);
+    for(let i=0;i<repairFiles.length;i++){const file=repairFiles[i];report({type:'writing',path:file,index:i+1,total:repairFiles.length,repairAttempt:repairAttempts});await writeGeneratedFiles(projectRoot,[{path:file,content:await generateFile(file,repairAttempts)}])}
+    if(command!=='npm install'&&repairFiles.some(file=>file.toLowerCase()==='package.json')&&manifest.commands.includes('npm install')){report({type:'command',command:'npm install'});await runCommand(projectRoot,'npm install')}
    }
   }
  }
  return {filesCreated:manifest.files.length,commandsPassed:manifest.commands.length,repairAttempts};
 }
 
-export async function runDeepSeekWorkflow(projectRoot:string,task:string,request:AssistantRequester,runCommand:CommandRunner=runNpm){
+export async function runDeepSeekWorkflow(projectRoot:string,task:string,request:AssistantRequester,runCommand:CommandRunner=runNpm,report:ProgressReporter=defaultProgressReporter){
+ report({type:'planning'});
  const manifest=await requestWithProtocolRetry(manifestPrompt(task),manifestCorrectionPrompt(),request,response=>parseProjectManifest(response,projectRoot));
  const generateFile:FileGenerator=async(file,attempt)=>requestWithProtocolRetry(filePrompt(file,task,manifest.files,attempt),fileCorrectionPrompt(file),request,extractFileContent);
  const planRepair:RepairPlanner=async(failure,attempt)=>requestWithProtocolRetry(repairManifestPrompt(failure,attempt,task,manifest.files),repairCorrectionPrompt(),request,response=>parseRepairManifest(response,projectRoot,manifest.files));
- return await executeProjectPlan(projectRoot,manifest,generateFile,planRepair,runCommand);
+ return await executeProjectPlan(projectRoot,manifest,generateFile,planRepair,runCommand,report);
 }
 
-export async function runSimpleDeepSeek(projectRoot:string,task:string){
+export async function runSimpleDeepSeek(projectRoot:string,task:string,report:ProgressReporter=defaultProgressReporter){
  projectRoot=path.resolve(projectRoot);await fs.mkdir(projectRoot,{recursive:true});
  const profile=path.join(appDir(),'chromium-profile');await fs.mkdir(profile,{recursive:true});
  const context=await chromium.launchPersistentContext(profile,{headless:false});
  try{
   const page=context.pages()[0]||await context.newPage();
   await page.goto('https://chat.deepseek.com/',{waitUntil:'domcontentloaded',timeout:60_000});
-  console.log('Waiting for DeepSeek chat input. Log in once in Chromium if needed...');
+  report({type:'idle'});
   const messages=page.locator('.ds-assistant-message-main-content');
   const request=async(prompt:string)=>{const start=await baseline(messages),input=await findChatInput(page);await input.click();await input.fill(prompt);await input.press('Enter');return await waitForCompletedResponse(page,start)};
-  return await runDeepSeekWorkflow(projectRoot,task,request);
+  return await runDeepSeekWorkflow(projectRoot,task,request,runNpm,report);
  }finally{await context.close()}
 }

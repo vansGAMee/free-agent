@@ -1,56 +1,94 @@
 # FreeAgent
 
-**FreeAgent turns the web AI you already use into a local coding agent — no API key, no copy/paste, verified by real builds and tests.**
+**A free local coding agent powered by the AI chat you already use in your browser.**
 
-FreeAgent is a small TypeScript CLI for Windows and Linux (including Arch). It drives DeepSeek Web, Qwen Web, Gemini Web, or a compatible Chromium web chat through the visible UI and Chrome DevTools Protocol. Generic mode is best-effort, not a guarantee for every site.
+FreeAgent drives your logged-in DeepSeek Web session, creates files on your machine, and runs a restricted set of local npm commands. It needs no AI API key.
 
-## Install and run
+FreeAgent is not fully offline. Internet access is required, and prompts are sent to DeepSeek through the browser. Windows is the currently confirmed platform.
 
-Requires Node.js 20+ and Edge, Chrome, or Chromium.
+## Quick start
 
-```sh
+Requires Node.js 20+.
+
+```powershell
+git clone https://github.com/vansGAMee/free-agent.git
+cd free-agent
 npm install
 npm run build
 npm link
-freeagent
 ```
 
-On first use, a visible, dedicated browser profile opens. Sign in to the selected provider once; authentication stays in that app-owned profile. FreeAgent never exports browser cookies. Then choose a project and enter one task. The browser exchange, local edits, commands, repair turns, and verification are automatic.
+Then run FreeAgent from any project folder:
 
-Thirty-second smoke flow:
-
-```sh
-freeagent --provider deepseek --project ./tmp/freeagent-smoke --task "Create a minimal Node project with index.js that prints FREEAGENT_OK and a package.json with a build/check script."
+```powershell
+cd C:\path\to\my-project
+freecodex . "Create a responsive landing page"
 ```
 
-Generic provider:
+A Chromium window opens. Log into DeepSeek once if needed; FreeAgent reuses its persistent browser session on later runs.
 
-```sh
-freeagent --provider generic --url https://example-chat.invalid --project ./project --task "Build the requested project"
+## Example
+
+```powershell
+freecodex . "Create a static landing page with index.html, styles.css and script.js"
 ```
 
-Other commands:
+```text
+FreeAgent
+local browser-powered coding agent
 
-```sh
-freeagent stats
-freeagent rollback --project ./project
-npm run dev -- --provider deepseek --project ./project --task "..."
-npm test
-npm run build
+|•_•| Mipi is planning the project...
+
+Plan
+  3 files
+  0 commands
+
+|^ᴗ^| Mipi is writing index.html [1/3]
+|^ᴗ^| Mipi is writing styles.css [2/3]
+|^ᴗ^| Mipi is writing script.js [3/3]
+
+SUCCESS
+Files: 3
+Commands: 0
 ```
 
-## Safety model
+Use `freecodex --plain ...` for undecorated output. Run `freecodex --help` for all CLI forms.
 
-All file actions are confined to the selected project with traversal and symlink checks. Writes are atomic and journaled for rollback. Commands use an explicit executable allowlist, parsed arguments, `shell:false`, bounded output, a timeout, and no privilege escalation or shell composition. FreeAgent uses an isolated browser profile and only the visible web UI. It does not bypass CAPTCHAs, rate limits, or permissions.
+The existing development invocation remains available:
 
-## Providers
+```powershell
+npm run dev -- "C:\path\to\project" --task "Create a responsive landing page"
+```
 
-Adapters for DeepSeek, Qwen, and Gemini contain only URLs and semantic hints; all fall back to the shared accessibility/geometry-based input discovery. To add a provider, add a small `ProviderAdapter` entry in `src/providers.ts` with its URL, accessible input/send/login hints, Enter behavior, and timeout.
+## How it works
 
-## Known limitations
+```text
+Task
+  ↓
+DeepSeek Web
+  ↓
+Manifest
+  ↓
+One file at a time
+  ↓
+Local project
+  ↓
+Safe npm verification
+```
 
-- Provider UI and authentication changes can require adapter-hint updates.
-- Generic mode requires a conventional, unambiguous semantic chat textbox.
-- Rollback covers tracked project files, not arbitrary external effects of third-party commands or huge ignored dependency directories.
-- Interrupted commands are not assumed successful; rerun causes local verification before further progress.
-- Portable single-file OS binaries are not yet produced; the npm-distributed CLI is the supported package.
+## Safety
+
+- Generated paths must be relative and remain inside the project root.
+- Only `npm install`, `npm install <packages>`, and `npm run <script>` are approved.
+- Commands use argument-based process spawning with `shell:false`; arbitrary shell commands are rejected.
+- Failed verification gets at most two targeted repair attempts.
+
+## Current status
+
+- Windows: confirmed
+- DeepSeek Web: confirmed
+- Multi-file generation: confirmed
+- npm install/build: confirmed
+- Bounded repair: implemented
+- Linux: not yet supported
+- Other AI providers: not yet supported
