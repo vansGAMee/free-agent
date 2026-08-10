@@ -2,6 +2,9 @@
 
 **A free local coding agent powered by the AI chat you already use in your browser.**
 
+#made by Mipi
+<img width="1280" height="866" alt="image" src="https://github.com/user-attachments/assets/4f52224e-f6b2-4bc1-a5cf-23ede6522d78" />
+
 FreeAgent drives your logged-in DeepSeek Web session, creates files on your machine, and runs a restricted set of local npm commands. It needs no AI API key.
 
 FreeAgent is not fully offline. Internet access is required, and prompts are sent to DeepSeek through the browser. Windows is the currently confirmed platform.
