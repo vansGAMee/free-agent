@@ -1,9 +1,11 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import {spawn} from 'node:child_process';
 import {chromium,type Locator,type Page} from 'playwright';
 import {appDir} from './config.js';
 
-interface GeneratedFile{path:string;content:string}
+export interface GeneratedFile{path:string;content:string}
+export interface GeneratedResponse{files:GeneratedFile[];commands:string[]}
 
 function promptFor(task:string){return `You are generating files for a local coding tool.
 
@@ -17,12 +19,15 @@ Return ONLY valid JSON in this shape:
       "path": "relative/path",
       "content": "<complete file content>"
     }
-  ]
+  ],
+  "commands": ["npm install", "npm run build"]
 }
 
 No markdown fences.
 No explanation.
-Use only relative paths.`}
+Use only relative paths.
+The commands field is optional. For Node projects, create a normal package.json with dependencies/devDependencies, usually include npm install, and include npm run build when a build script exists.
+Follow the requested project structure exactly. If the task requires npm packages, include package.json and commands. Do not simplify a requested multi-file/npm project into one HTML file.`}
 
 async function findChatInput(page:Page,timeoutMs=300_000):Promise<Locator>{
  const candidates=page.locator('main textarea, main [contenteditable="true"], main [role="textbox"], textarea, [contenteditable="true"], [role="textbox"]');
@@ -56,36 +61,43 @@ function jsonObjects(text:string){
  return values;
 }
 
-function validFiles(value:unknown):GeneratedFile[]|null{
+function validResponse(value:unknown):GeneratedResponse|null{
  if(!value||typeof value!=='object'||!Array.isArray((value as any).files))return null;
  const files=(value as any).files;
  if(!files.length||!files.every((file:any)=>file&&typeof file.path==='string'&&typeof file.content==='string'))return null;
  if(files.length===1&&files[0].path==='relative/path'&&files[0].content==='<complete file content>')return null;
- return files;
+ const commands=(value as any).commands;
+ if(commands!==undefined&&(!Array.isArray(commands)||!commands.every((command:unknown)=>typeof command==='string')))return null;
+ return {files,commands:commands??[]};
 }
 
 function decodeLooseString(value:string){try{return JSON.parse(`"${value}"`) as string}catch{return JSON.parse(`"${value.replace(/(?<!\\)"/g,'\\"')}"`) as string}}
 
-function fileResponses(text:string){
- const responses=jsonObjects(text).map(validFiles).filter((x):x is GeneratedFile[]=>x!==null);
+export function generatedResponses(text:string){
+ const responses=jsonObjects(text).map(validResponse).filter((x):x is GeneratedResponse=>x!==null);
  const loose:GeneratedFile[]=[];
  const blocks=/"path"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"([\s\S]*?)"\s*}\s*(?=,|\])/g;
+ let lastFileEnd=0;
  for(const match of text.matchAll(blocks)){
   const file={path:decodeLooseString(match[1]),content:decodeLooseString(match[2])};
-  if(file.path!=='relative/path'||file.content!=='<complete file content>')loose.push(file);
+  if(file.path!=='relative/path'||file.content!=='<complete file content>'){loose.push(file);lastFileEnd=(match.index??0)+match[0].length}
  }
- if(loose.length)responses.push(loose);
+ if(loose.length){const commandMatch=text.slice(lastFileEnd).match(/"commands"\s*:\s*(\[(?:\s*"(?:\\.|[^"\\])*"\s*,?)*\s*\])/);let commands:string[]=[];if(commandMatch){try{commands=JSON.parse(commandMatch[1])}catch{}}responses.push({files:loose,commands})}
  return responses;
 }
 
-async function waitForFiles(page:Page,baseline:number,timeoutMs=300_000){
+export function latestNewResponse(messageTexts:string[],baselineCount:number){if(messageTexts.length<=baselineCount)return null;return generatedResponses(messageTexts.at(-1)!).at(-1)??null}
+
+async function waitForNewResponse(page:Page,baselineCount:number,timeoutMs=300_000){
+ const messages=page.locator('.ds-assistant-message-main-content');
  const end=Date.now()+timeoutMs;
+ let previous='',stableChecks=0;
  while(Date.now()<end){
-  const text=await page.locator('body').innerText(),matches=fileResponses(text);
-  if(matches.length>baseline)return matches.at(-1)!;
+  const count=await messages.count();
+  if(count>baselineCount){const text=await messages.last().innerText();const response=latestNewResponse([text],0);stableChecks=text===previous?stableChecks+1:0;previous=text;if(response&&stableChecks>=4)return response}
   await page.waitForTimeout(750);
  }
- throw new Error('DeepSeek did not return a valid files JSON response in time.')
+ throw new Error('DeepSeek did not finish a new valid files JSON response in time.')
 }
 
 function resolveOutput(projectRoot:string,relative:string){
@@ -94,6 +106,14 @@ function resolveOutput(projectRoot:string,relative:string){
  if(target===root||!target.startsWith(root+path.sep))throw new Error(`File path escapes project root: ${relative}`);
  return target;
 }
+
+export async function writeGeneratedFiles(projectRoot:string,files:GeneratedFile[]){for(const file of files){const target=resolveOutput(projectRoot,file.path);await fs.mkdir(path.dirname(target),{recursive:true});await fs.writeFile(target,file.content,'utf8')}}
+
+export function parseAllowedNpmCommand(command:string){const parts=command.trim().split(/\s+/);if(parts[0]!=='npm')throw new Error(`Unsafe command rejected: ${command}`);if(parts[1]==='install'&&parts.slice(2).every(part=>/^[A-Za-z0-9@][A-Za-z0-9@._/+~-]*$/.test(part)))return parts.slice(1);if(parts[1]==='run'&&parts.length===3&&/^[A-Za-z0-9_.:-]+$/.test(parts[2]))return parts.slice(1);throw new Error(`Unsafe command rejected: ${command}`)}
+
+async function runNpm(projectRoot:string,command:string,timeoutMs=120_000){let args=parseAllowedNpmCommand(command),executable='npm';if(process.platform==='win32'){executable=process.execPath;args=[path.join(path.dirname(process.execPath),'node_modules','npm','bin','npm-cli.js'),...args]}return new Promise<void>((resolve,reject)=>{const child=spawn(executable,args,{cwd:projectRoot,shell:false,windowsHide:true});let output='';const collect=(chunk:Buffer)=>{output=(output+chunk.toString()).slice(-4000)};child.stdout.on('data',collect);child.stderr.on('data',collect);const timer=setTimeout(()=>child.kill(),timeoutMs);child.on('error',error=>{clearTimeout(timer);reject(Object.assign(error,{command,exitCode:'spawn error'}))});child.on('close',code=>{clearTimeout(timer);if(output.trim())console.log(output.trim());if(code===0)resolve();else reject(Object.assign(new Error(`Command failed: ${command}`),{command,exitCode:code??'unknown'}))})})}
+
+export async function applyGeneratedResponse(projectRoot:string,response:GeneratedResponse){response.commands.forEach(parseAllowedNpmCommand);await writeGeneratedFiles(projectRoot,response.files);for(const command of response.commands)await runNpm(projectRoot,command);return {filesCreated:response.files.length,commandsPassed:response.commands.length}}
 
 export async function runSimpleDeepSeek(projectRoot:string,task:string){
  projectRoot=path.resolve(projectRoot);await fs.mkdir(projectRoot,{recursive:true});
@@ -104,11 +124,10 @@ export async function runSimpleDeepSeek(projectRoot:string,task:string){
   const page=context.pages()[0]||await context.newPage();
   await page.goto('https://chat.deepseek.com/',{waitUntil:'domcontentloaded',timeout:60_000});
   console.log('Waiting for DeepSeek chat input. Log in once in Chromium if needed...');
-  const input=await findChatInput(page),beforeText=await page.locator('body').innerText(),baseline=fileResponses(beforeText).length;
+  const input=await findChatInput(page),assistantMessages=page.locator('.ds-assistant-message-main-content'),baseline=await assistantMessages.count();
   await input.click();await input.fill(promptFor(task));await input.press('Enter');
   console.log('Message sent. Waiting for DeepSeek JSON response...');
-  const files=await waitForFiles(page,baseline);
-  for(const file of files){const target=resolveOutput(projectRoot,file.path);await fs.mkdir(path.dirname(target),{recursive:true});await fs.writeFile(target,file.content,'utf8')}
-  return files.length;
+  const response=await waitForNewResponse(page,baseline);
+  return await applyGeneratedResponse(projectRoot,response);
  }finally{await context.close()}
 }

@@ -13,7 +13,7 @@ async function main(){
  const task=optionValue(args,'--task')||await rl.question('Task: ');
  rl.close();
  if(!task.trim())throw new Error('Task is empty.');
- const count=await runSimpleDeepSeek(path.resolve(project),task.trim());
- console.log(`SUCCESS\nFiles created: ${count}`);
+ const result=await runSimpleDeepSeek(path.resolve(project),task.trim());
+ console.log(`SUCCESS\nFiles created: ${result.filesCreated}\nCommands passed: ${result.commandsPassed}`);
 }
-main().catch(error=>{console.error(`FAILED: ${error.message}`);process.exitCode=1});
+main().catch(error=>{if(error.command)console.error(`FAILED\nCommand: ${error.command}\nExit code: ${error.exitCode}`);else console.error(`FAILED: ${error.message}`);process.exitCode=1});
