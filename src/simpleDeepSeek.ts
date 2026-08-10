@@ -80,12 +80,18 @@ export function generatedResponses(text:string){
 
 export function latestNewResponse(messageTexts:string[],baselineCount:number){if(messageTexts.length<=baselineCount)return null;return generatedResponses(messageTexts.at(-1)!).at(-1)??null}
 
-async function waitForNewResponse(page:Page,baselineCount:number,timeoutMs=300_000){
+async function waitForNewResponse(page:Page,baselineCount:number,baselineLastText:string,timeoutMs=300_000){
  const messages=page.locator('.ds-assistant-message-main-content');
  const end=Date.now()+timeoutMs;
-  while(Date.now()<end){
+ while(Date.now()<end){
   const count=await messages.count();
-  if(count>baselineCount){const text=await messages.last().innerText();const response=latestNewResponse([text],0);if(response)return response}
+  if(count>0){
+   const text=await messages.last().innerText();
+   if(count>baselineCount||text!==baselineLastText){
+    const response=latestNewResponse([text],0);
+    if(response)return response;
+   }
+  }
   await page.waitForTimeout(750);
  }
  throw new Error('DeepSeek did not finish a new valid files JSON response in time.')
@@ -127,14 +133,14 @@ export async function runSimpleDeepSeek(projectRoot:string,task:string){
   const page=context.pages()[0]||await context.newPage();
   await page.goto('https://chat.deepseek.com/',{waitUntil:'domcontentloaded',timeout:60_000});
   console.log('Waiting for DeepSeek chat input. Log in once in Chromium if needed...');
-  const input=await findChatInput(page),assistantMessages=page.locator('.ds-assistant-message-main-content'),baseline=await assistantMessages.count();
+  const input=await findChatInput(page),assistantMessages=page.locator('.ds-assistant-message-main-content'),baseline=await assistantMessages.count(),baselineLastText=baseline?await assistantMessages.last().innerText():'';
   await input.click();await input.fill(promptFor(task));await input.press('Enter');
   console.log('Message sent. Waiting for DeepSeek JSON response...');
-  const response=await waitForNewResponse(page,baseline);
+  const response=await waitForNewResponse(page,baseline,baselineLastText);
   return await applyGeneratedResponse(projectRoot,response,async(failure,attempt)=>{
-   const repairBaseline=await assistantMessages.count(),repairInput=await findChatInput(page);
+   const repairBaseline=await assistantMessages.count(),repairBaselineLastText=repairBaseline?await assistantMessages.last().innerText():'',repairInput=await findChatInput(page);
    await repairInput.click();await repairInput.fill(repairPrompt(failure,attempt));await repairInput.press('Enter');
-   return await waitForNewResponse(page,repairBaseline);
+   return await waitForNewResponse(page,repairBaseline,repairBaselineLastText);
   });
  }finally{await context.close()}
 }
