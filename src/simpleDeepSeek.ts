@@ -4,33 +4,69 @@ import {spawn} from 'node:child_process';
 import {chromium,type Locator,type Page} from 'playwright';
 import {appDir} from './config.js';
 
+export const COMPLETION_SENTINEL='FREEAGENT_END';
+export interface ProjectManifest{files:string[];commands:string[]}
 export interface GeneratedFile{path:string;content:string}
-export interface GeneratedResponse{files:GeneratedFile[];commands:string[]}
+export interface AssistantResponse{text:string;codeBlocks:string[]}
 export interface CommandFailure extends Error{command:string;exitCode:number|string;output:string;repairAttempts?:number}
-export type RepairResponse=(failure:CommandFailure,attempt:number)=>Promise<GeneratedResponse>;
 export type CommandRunner=(projectRoot:string,command:string)=>Promise<void>;
+export type FileGenerator=(relativePath:string,repairAttempt:number)=>Promise<string>;
+export type RepairPlanner=(failure:CommandFailure,attempt:number)=>Promise<string[]>;
+export type AssistantRequester=(prompt:string)=>Promise<AssistantResponse>;
+type ResponseBaseline={count:number;lastText:string};
 
-function promptFor(task:string){return `You are generating files for a local coding tool.
-
-User task:
+function manifestPrompt(task:string){return `Plan a complete local project for this user task:
 ${task}
 
-Return ONLY valid JSON in this shape:
-{
-  "files": [
-    {
-      "path": "relative/path",
-      "content": "<complete file content>"
-    }
-  ],
-  "commands": ["npm install", "npm run build"]
-}
+Return exactly ONE fenced JSON code block in this shape:
+\`\`\`json
+{"files":["package.json","src/example.js"],"commands":["npm install","npm run build"]}
+\`\`\`
+${COMPLETION_SENTINEL}
 
-No markdown fences.
-No explanation.
-Use only relative paths.
-The commands field is optional. For Node projects, create a normal package.json with dependencies/devDependencies, usually include npm install, and include npm run build when a build script exists.
-Follow the requested project structure exactly. If the task requires npm packages, include package.json and commands. Do not simplify a requested multi-file/npm project into one HTML file.`}
+The files array must contain only relative file paths. Do not include file contents. Do not add explanation.`}
+
+function manifestCorrectionPrompt(){return `Protocol correction: return exactly one fenced JSON code block containing only a project manifest with string arrays "files" and "commands". Do not include file contents or explanation. After the code block output exactly ${COMPLETION_SENTINEL}.`}
+
+function filePrompt(relativePath:string,task:string,knownFiles:string[],repairAttempt:number){return `Generate the complete content for exactly this file:
+${relativePath}
+
+It must satisfy the original user task:
+${task}
+
+It must remain compatible with these project files:
+${knownFiles.join('\n')}
+${repairAttempt?`This is repair attempt ${repairAttempt}; replace the complete file.`:''}
+
+Return exactly ONE fenced code block containing the COMPLETE file content.
+After the code block output exactly:
+${COMPLETION_SENTINEL}
+
+No explanation. Do not omit unchanged sections. Do not return JSON. Do not return another file.`}
+
+function fileCorrectionPrompt(relativePath:string){return `Protocol correction for ${relativePath}: return exactly one fenced code block containing only that file's complete content, then output exactly ${COMPLETION_SENTINEL}. No explanation, JSON, or other files.`}
+
+function repairManifestPrompt(failure:CommandFailure,attempt:number,task:string,knownFiles:string[]){return `Repair attempt ${attempt} of 2 for this project.
+Original task:
+${task}
+
+Known project files:
+${knownFiles.join('\n')}
+
+Failed command: ${failure.command}
+Exit code: ${failure.exitCode}
+Output tail:
+${failure.output.slice(-12_000)}
+
+Return exactly ONE fenced JSON code block naming only the files that must be regenerated:
+\`\`\`json
+{"files":["src/example.js"]}
+\`\`\`
+${COMPLETION_SENTINEL}
+
+No commands, file contents, or explanation.`}
+
+function repairCorrectionPrompt(){return `Protocol correction: return exactly one fenced JSON code block with a non-empty "files" string array naming only existing planned files, then output exactly ${COMPLETION_SENTINEL}. No commands, contents, or explanation.`}
 
 async function findChatInput(page:Page,timeoutMs=300_000):Promise<Locator>{
  const candidates=page.locator('main textarea, main [contenteditable="true"], main [role="textbox"], textarea, [contenteditable="true"], [role="textbox"]');
@@ -50,52 +86,71 @@ async function findChatInput(page:Page,timeoutMs=300_000):Promise<Locator>{
  throw new Error('DeepSeek chat input did not appear. Finish login in the opened Chromium window.')
 }
 
-function jsonObjects(text:string){
- const values:unknown[]=[];
- for(let start=0;start<text.length;start++){
-  if(text[start]!=='{')continue;
-  let depth=0,inString=false,escaped=false;
-  for(let i=start;i<text.length;i++){
-   const ch=text[i];
-   if(inString){if(escaped)escaped=false;else if(ch==='\\')escaped=true;else if(ch==='"')inString=false;continue}
-   if(ch==='"'){inString=true;continue}if(ch==='{')depth++;else if(ch==='}'&&--depth===0){try{values.push(JSON.parse(text.slice(start,i+1)))}catch{}break}
-  }
- }
+function hasCompletionSentinel(text:string){return text.trimEnd().endsWith(COMPLETION_SENTINEL)}
+
+async function baseline(messages:Locator):Promise<ResponseBaseline>{const count=await messages.count();return {count,lastText:count?(await messages.last().textContent().catch(()=>null))??'':''}}
+
+async function codeBlockTexts(message:Locator){
+ let blocks=message.locator('pre code');
+ if(await blocks.count()===0)blocks=message.locator('pre');
+ const values:string[]=[];
+ for(let i=0;i<await blocks.count();i++)values.push((await blocks.nth(i).textContent().catch(()=>null))??'');
  return values;
 }
 
-function validResponse(value:unknown):GeneratedResponse|null{
- if(!value||typeof value!=='object'||!Array.isArray((value as any).files))return null;
- const files=(value as any).files;
- if(!files.length||!files.every((file:any)=>file&&typeof file.path==='string'&&typeof file.content==='string'))return null;
- if(files.length===1&&files[0].path==='relative/path'&&files[0].content==='<complete file content>')return null;
- const commands=(value as any).commands;
- if(commands!==undefined&&(!Array.isArray(commands)||!commands.every((command:unknown)=>typeof command==='string')))return null;
- return {files,commands:commands??[]};
-}
-
-export function generatedResponses(text:string){
- return jsonObjects(text).map(validResponse).filter((x):x is GeneratedResponse=>x!==null);
-}
-
-export function latestNewResponse(messageTexts:string[],baselineCount:number){if(messageTexts.length<=baselineCount)return null;return generatedResponses(messageTexts.at(-1)!).at(-1)??null}
-
-async function waitForNewResponse(page:Page,baselineCount:number,baselineLastText:string,timeoutMs=300_000){
+async function waitForCompletedResponse(page:Page,start:{count:number;lastText:string},timeoutMs=300_000):Promise<AssistantResponse>{
  const messages=page.locator('.ds-assistant-message-main-content');
  const end=Date.now()+timeoutMs;
+ let previousText='';
+ let lastChangeAt=Date.now();
+ let sawNewResponse=false;
+
  while(Date.now()<end){
   const count=await messages.count();
+
   if(count>0){
-   const text=await messages.last().innerText();
-   if(count>baselineCount||text!==baselineLastText){
-    const response=latestNewResponse([text],0);
-    if(response)return response;
+   const message=messages.last();
+   const text=(await message.textContent().catch(()=>null))??'';
+   const isNew=text!==start.lastText;
+
+   if(isNew){
+    sawNewResponse=true;
+
+    if(text!==previousText){
+     previousText=text;
+     lastChangeAt=Date.now();
+    }
+
+    if(hasCompletionSentinel(text)){
+     return {text,codeBlocks:await codeBlockTexts(message)};
+    }
+
+    // DeepSeek sometimes finishes a response but omits FREEAGENT_END.
+    // Return a stable completed-looking response so the protocol parser
+    // can reject it and request one correction instead of hanging.
+    if(text.trim()&&Date.now()-lastChangeAt>=8_000){
+     return {text,codeBlocks:await codeBlockTexts(message)};
+    }
    }
   }
-  await page.waitForTimeout(750);
+
+  await page.waitForTimeout(500);
  }
- throw new Error('DeepSeek did not finish a new valid files JSON response in time.')
+
+ if(sawNewResponse)throw new Error(`DeepSeek response became stable but did not satisfy the protocol.`);
+ throw new Error(`DeepSeek response timed out before ${COMPLETION_SENTINEL}.`);
 }
+
+function fencedBlocks(text:string){return [...text.matchAll(/```(?:json)?[^\S\r\n]*(?:\r?\n)?([\s\S]*?)```/gi)].map(match=>match[1])}
+
+function jsonFromResponse(response:AssistantResponse){
+ if(!hasCompletionSentinel(response.text))throw new Error(`Response is missing ${COMPLETION_SENTINEL}.`);
+ const blocks=response.codeBlocks.length?response.codeBlocks:fencedBlocks(response.text);
+ if(blocks.length!==1)throw new Error('Expected exactly one fenced JSON code block.');
+ try{return JSON.parse(blocks[0]) as unknown}catch{throw new Error('Invalid JSON manifest.')}
+}
+
+function record(value:unknown):Record<string,unknown>{if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Manifest must be a JSON object.');return value as Record<string,unknown>}
 
 function resolveOutput(projectRoot:string,relative:string){
  if(!relative||path.win32.isAbsolute(relative)||path.posix.isAbsolute(relative)||relative.includes('\0'))throw new Error(`Unsafe file path from DeepSeek: ${relative}`);
@@ -104,43 +159,148 @@ function resolveOutput(projectRoot:string,relative:string){
  return target;
 }
 
-export async function writeGeneratedFiles(projectRoot:string,files:GeneratedFile[]){for(const file of files){const target=resolveOutput(projectRoot,file.path);await fs.mkdir(path.dirname(target),{recursive:true});await fs.writeFile(target,file.content,'utf8')}}
+function validateFilePaths(projectRoot:string,value:unknown,knownFiles?:string[]){
+ if(!Array.isArray(value)||!value.length||!value.every(item=>typeof item==='string'))throw new Error('Manifest files must be a non-empty string array.');
+ const files=value as string[],seen=new Set<string>(),known=knownFiles?new Set(knownFiles.map(file=>resolveOutput(projectRoot,file).toLowerCase())):null;
+ for(const file of files){const target=resolveOutput(projectRoot,file),key=target.toLowerCase();if(seen.has(key))throw new Error(`Duplicate file path: ${file}`);if(known&&!known.has(key))throw new Error(`Repair path was not in the project manifest: ${file}`);seen.add(key)}
+ return [...files];
+}
 
 export function parseAllowedNpmCommand(command:string){const parts=command.trim().split(/\s+/);if(parts[0]!=='npm')throw new Error(`Unsafe command rejected: ${command}`);if(parts[1]==='install'&&parts.slice(2).every(part=>/^[A-Za-z0-9@][A-Za-z0-9@._/+~-]*$/.test(part)))return parts.slice(1);if(parts[1]==='run'&&parts.length===3&&/^[A-Za-z0-9_.:-]+$/.test(parts[2]))return parts.slice(1);throw new Error(`Unsafe command rejected: ${command}`)}
 
-async function runNpm(projectRoot:string,command:string,timeoutMs=120_000){const args=parseAllowedNpmCommand(command),executable=process.platform==='win32'?'npm.cmd':'npm';return new Promise<void>((resolve,reject)=>{const child=spawn(executable,args,{cwd:projectRoot,shell:false,windowsHide:true});let output='';const collect=(chunk:Buffer)=>{output=(output+chunk.toString()).slice(-12_000)};child.stdout.on('data',collect);child.stderr.on('data',collect);const timer=setTimeout(()=>child.kill(),timeoutMs);child.on('error',error=>{clearTimeout(timer);reject(Object.assign(error,{command,exitCode:'spawn error',output}))});child.on('close',code=>{clearTimeout(timer);if(output.trim())console.log(output.trim());if(code===0)resolve();else reject(Object.assign(new Error(`Command failed: ${command}`),{command,exitCode:code??'unknown',output}))})})}
+export function validateProjectManifest(projectRoot:string,value:unknown):ProjectManifest{
+ const manifest=record(value),files=validateFilePaths(projectRoot,manifest.files);
+ if(!Array.isArray(manifest.commands)||!manifest.commands.every(command=>typeof command==='string'))throw new Error('Manifest commands must be a string array.');
+ const commands=manifest.commands as string[];commands.forEach(parseAllowedNpmCommand);
+ return {files,commands:[...commands]};
+}
+
+export function parseProjectManifest(response:AssistantResponse,projectRoot:string){return validateProjectManifest(projectRoot,jsonFromResponse(response))}
+
+export function parseRepairManifest(response:AssistantResponse,projectRoot:string,knownFiles:string[]){const value=record(jsonFromResponse(response));if('commands' in value)throw new Error('Repair manifest must not contain commands.');return validateFilePaths(projectRoot,value.files,knownFiles)}
+
+export function extractFileContent(response:AssistantResponse){if(!hasCompletionSentinel(response.text))throw new Error(`Response is missing ${COMPLETION_SENTINEL}.`);if(response.codeBlocks.length!==1)throw new Error('Expected exactly one fenced source code block.');return response.codeBlocks[0]}
+
+export async function requestWithProtocolRetry<T>(initialPrompt:string,correctionPrompt:string,request:(prompt:string)=>Promise<AssistantResponse>,parse:(response:AssistantResponse)=>T){let error:unknown;for(const prompt of [initialPrompt,correctionPrompt]){try{return parse(await request(prompt))}catch(caught){error=caught}}throw error}
+
+export async function writeGeneratedFiles(projectRoot:string,files:GeneratedFile[]){for(const file of files){const target=resolveOutput(projectRoot,file.path);await fs.mkdir(path.dirname(target),{recursive:true});await fs.writeFile(target,file.content,'utf8')}}
+
+async function runNpm(projectRoot:string,command:string,timeoutMs=600_000){
+ const npmArgs=parseAllowedNpmCommand(command);
+ const npmExecPath=process.env.npm_execpath;
+
+ const executable=process.platform==='win32'
+  ? npmExecPath
+   ? process.execPath
+   : process.env.ComSpec||'cmd.exe'
+  : 'npm';
+
+ const args=process.platform==='win32'
+  ? npmExecPath
+   ? [npmExecPath,...npmArgs]
+   : ['/d','/s','/c','npm.cmd',...npmArgs]
+  : npmArgs;
+
+ return new Promise<void>((resolve,reject)=>{
+  const child=spawn(executable,args,{
+   cwd:projectRoot,
+   shell:false,
+   windowsHide:true
+  });
+
+  let output='';
+  let timedOut=false;
+  let settled=false;
+
+  const collect=(chunk:Buffer)=>{
+   const text=chunk.toString();
+   process.stdout.write(text);
+   output=(output+text).slice(-12_000);
+  };
+
+  child.stdout.on('data',collect);
+  child.stderr.on('data',collect);
+
+  const timer=setTimeout(()=>{
+   timedOut=true;
+   console.error(`Command timed out after ${timeoutMs}ms: ${command}`);
+   child.kill();
+  },timeoutMs);
+
+  child.on('error',error=>{
+   if(settled)return;
+   settled=true;
+   clearTimeout(timer);
+   reject(Object.assign(error,{
+    command,
+    exitCode:'spawn error',
+    output
+   }));
+  });
+
+  child.on('close',(code,signal)=>{
+   if(settled)return;
+   settled=true;
+   clearTimeout(timer);
+
+   if(code===0){
+    resolve();
+    return;
+   }
+
+   const exitCode=timedOut
+    ? 'timeout'
+    : code!==null
+      ? code
+      : signal
+        ? `signal ${signal}`
+        : 'unknown';
+
+   reject(Object.assign(
+    new Error(timedOut?`Command timed out: ${command}`:`Command failed: ${command}`),
+    {command,exitCode,output}
+   ));
+  });
+ });
+}
 
 function commandFailure(error:unknown,command:string){const failure=(error instanceof Error?error:new Error(String(error))) as CommandFailure;failure.command||=command;failure.exitCode??='unknown';failure.output??='';return failure}
 
-export async function applyGeneratedResponse(projectRoot:string,response:GeneratedResponse,repair?:RepairResponse,runCommand:CommandRunner=runNpm){response.commands.forEach(parseAllowedNpmCommand);await writeGeneratedFiles(projectRoot,response.files);let repairAttempts=0;for(const command of response.commands){while(true){try{await runCommand(projectRoot,command);break}catch(error){const failure=commandFailure(error,command);if(!repair||repairAttempts>=2){failure.repairAttempts=repairAttempts;throw failure}const replacement=await repair(failure,++repairAttempts);await writeGeneratedFiles(projectRoot,replacement.files)}}}return {filesCreated:response.files.length,commandsPassed:response.commands.length,repairAttempts}}
+export async function executeProjectPlan(projectRoot:string,value:ProjectManifest,generateFile:FileGenerator,planRepair?:RepairPlanner,runCommand:CommandRunner=runNpm){
+ const manifest=validateProjectManifest(projectRoot,value);let repairAttempts=0;
+ console.log(`Plan: ${manifest.files.length} files, ${manifest.commands.length} commands`);
+ for(let i=0;i<manifest.files.length;i++){const file=manifest.files[i];console.log(`Generating ${i+1}/${manifest.files.length}: ${file}`);await writeGeneratedFiles(projectRoot,[{path:file,content:await generateFile(file,0)}]);console.log(`Wrote: ${file}`)}
+ for(const command of manifest.commands){
+  while(true){
+   try{await runCommand(projectRoot,command);break}catch(error){
+    const failure=commandFailure(error,command);
+    if(!planRepair||repairAttempts>=2){failure.repairAttempts=repairAttempts;throw failure}
+    const repairFiles=validateFilePaths(projectRoot,await planRepair(failure,++repairAttempts),manifest.files);
+    for(let i=0;i<repairFiles.length;i++){const file=repairFiles[i];console.log(`Repairing ${i+1}/${repairFiles.length}: ${file}`);await writeGeneratedFiles(projectRoot,[{path:file,content:await generateFile(file,repairAttempts)}]);console.log(`Wrote: ${file}`)}
+    if(command!=='npm install'&&repairFiles.some(file=>file.toLowerCase()==='package.json')&&manifest.commands.includes('npm install'))await runCommand(projectRoot,'npm install');
+   }
+  }
+ }
+ return {filesCreated:manifest.files.length,commandsPassed:manifest.commands.length,repairAttempts};
+}
 
-function repairPrompt(failure:CommandFailure,attempt:number){return `The generated project failed verification. Repair attempt ${attempt} of 2.
-Failed command: ${failure.command}
-Exit code: ${failure.exitCode}
-Output:
-${failure.output.slice(-12_000)}
-
-Return ONLY valid JSON with complete replacement file contents in this shape:
-{"files":[{"path":"relative/path","content":"<complete replacement file content>"}]}
-No markdown fences, explanation, or commands. Use only relative paths.`}
+export async function runDeepSeekWorkflow(projectRoot:string,task:string,request:AssistantRequester,runCommand:CommandRunner=runNpm){
+ const manifest=await requestWithProtocolRetry(manifestPrompt(task),manifestCorrectionPrompt(),request,response=>parseProjectManifest(response,projectRoot));
+ const generateFile:FileGenerator=async(file,attempt)=>requestWithProtocolRetry(filePrompt(file,task,manifest.files,attempt),fileCorrectionPrompt(file),request,extractFileContent);
+ const planRepair:RepairPlanner=async(failure,attempt)=>requestWithProtocolRetry(repairManifestPrompt(failure,attempt,task,manifest.files),repairCorrectionPrompt(),request,response=>parseRepairManifest(response,projectRoot,manifest.files));
+ return await executeProjectPlan(projectRoot,manifest,generateFile,planRepair,runCommand);
+}
 
 export async function runSimpleDeepSeek(projectRoot:string,task:string){
  projectRoot=path.resolve(projectRoot);await fs.mkdir(projectRoot,{recursive:true});
- const profile=path.join(appDir(),'chromium-profile');
- await fs.mkdir(profile,{recursive:true});
+ const profile=path.join(appDir(),'chromium-profile');await fs.mkdir(profile,{recursive:true});
  const context=await chromium.launchPersistentContext(profile,{headless:false});
  try{
   const page=context.pages()[0]||await context.newPage();
   await page.goto('https://chat.deepseek.com/',{waitUntil:'domcontentloaded',timeout:60_000});
   console.log('Waiting for DeepSeek chat input. Log in once in Chromium if needed...');
-  const input=await findChatInput(page),assistantMessages=page.locator('.ds-assistant-message-main-content'),baseline=await assistantMessages.count(),baselineLastText=baseline?await assistantMessages.last().innerText():'';
-  await input.click();await input.fill(promptFor(task));await input.press('Enter');
-  console.log('Message sent. Waiting for DeepSeek JSON response...');
-  const response=await waitForNewResponse(page,baseline,baselineLastText);
-  return await applyGeneratedResponse(projectRoot,response,async(failure,attempt)=>{
-   const repairBaseline=await assistantMessages.count(),repairBaselineLastText=repairBaseline?await assistantMessages.last().innerText():'',repairInput=await findChatInput(page);
-   await repairInput.click();await repairInput.fill(repairPrompt(failure,attempt));await repairInput.press('Enter');
-   return await waitForNewResponse(page,repairBaseline,repairBaselineLastText);
-  });
+  const messages=page.locator('.ds-assistant-message-main-content');
+  const request=async(prompt:string)=>{const start=await baseline(messages),input=await findChatInput(page);await input.click();await input.fill(prompt);await input.press('Enter');return await waitForCompletedResponse(page,start)};
+  return await runDeepSeekWorkflow(projectRoot,task,request);
  }finally{await context.close()}
 }
